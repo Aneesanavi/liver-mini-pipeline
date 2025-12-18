@@ -1,0 +1,22 @@
+# Data and results
+data/
+results/
+
+# Nextflow
+work/
+.nextflow*
+trace.txt
+timeline.html
+report.html
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# R Markdown
+*.html
+
+# OS files
+.DS_Store
+Thumbs.db
