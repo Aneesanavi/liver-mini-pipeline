@@ -1,0 +1,114 @@
+# =========================
+# NOTEBOOK 02 (ALL-IN-ONE)
+# Data Download + Standardization + Annotation
+# =========================
+
+```{r}
+# ---- Always run from project root (because .Rmd is inside notebooks/) ----
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+# ---- 0) Quick check: where am I? ----
+getwd()
+
+# ---- 1) Confirm required files exist ----
+list.files("data", recursive = TRUE)
+
+counts_path <- "data/GSE126848/GSE126848_Gene_counts_raw.txt"
+series_path <- "data/GSE126848_series_matrix.txt"
+
+stopifnot(file.exists(counts_path))
+stopifnot(file.exists(series_path))
+
+# ---- 2) Load raw counts (gene x sample counts) ----
+counts <- read.delim(counts_path, check.names = FALSE)
+dim(counts)
+head(counts[, 1:5])
+
+# ---- 3) Save standardized counts file ----
+write.table(
+  counts,
+  file = "data/raw_counts.tsv",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+stopifnot(file.exists("data/raw_counts.tsv"))
+
+# ---- 4) Create base metadata (sample IDs from counts) ----
+sample_names <- colnames(counts)[-1]
+
+# keep sample IDs as 4-digit strings when possible (e.g., 869 -> "0869"),
+# and keep larger IDs (2683, 3993, etc.) as-is (sprintf keeps them unchanged)
+sample_names <- sprintf("%04d", as.integer(sample_names))
+
+metadata <- data.frame(
+  sample = sample_names,
+  group  = "unknown",
+  stringsAsFactors = FALSE
+)
+
+# ---- 5) Load GEO annotation (series matrix) ----
+library(GEOquery)
+library(Biobase)
+
+eset <- getGEO(filename = series_path, GSEMatrix = TRUE)
+stopifnot(inherits(eset, "ExpressionSet"))
+
+pd <- pData(eset)
+stopifnot(nrow(pd) == length(sample_names))  # critical: same number of samples
+
+# ---- 6) Derive group labels from GEO disease field ----
+# In this dataset, disease status is stored here:
+disease_text <- pd[["characteristics_ch1.2"]]  # e.g., "disease: NAFLD"
+
+group <- ifelse(
+  grepl("control|healthy|normal", disease_text, ignore.case = TRUE), "control",
+  ifelse(grepl("NAFL|NAFLD|NASH|MASH", disease_text, ignore.case = TRUE), "disease", "unknown")
+)
+
+# ---- 7) Save an audit mapping table (recommended for traceability) ----
+dir.create("data/GSE126848", showWarnings = FALSE)
+
+map <- data.frame(
+  sample = sample_names,             # count-matrix sample IDs (0869… / 2683… / 3993… etc.)
+  geo_accession = pd$geo_accession,  # GSM IDs
+  title = pd$title,                  # NAFL_1, NAFL_2, etc.
+  disease_text = disease_text,       # "disease: NAFLD" etc.
+  group = group,
+  stringsAsFactors = FALSE
+)
+
+write.table(
+  map,
+  file = "data/GSE126848/sample_map.tsv",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# ---- 8) Update metadata with final group labels + save permanently ----
+metadata$group <- map$group
+
+write.table(
+  metadata,
+  file = "data/metadata.tsv",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# ---- 9) Verification (important) ----
+meta_check <- read.delim(
+  "data/metadata.tsv",
+  check.names = FALSE,
+  colClasses = c("character", "character")
+)
+
+mat_sample_names <- sprintf("%04d", as.integer(colnames(counts)[-1]))
+stopifnot(all(mat_sample_names == meta_check$sample))
+
+table(meta_check$group)
+head(meta_check)
+head(map)
+```
+
