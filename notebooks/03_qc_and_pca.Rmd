@@ -1,0 +1,120 @@
+# =========================
+# NOTEBOOK 03 (ALL-IN-ONE)
+# QC + PCA (read-only analysis)
+# =========================
+```{r}
+# Run notebook from project root
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+# Create results folder
+dir.create("results", showWarnings = FALSE)
+
+# ---- 1) Load standardized inputs ----
+counts <- read.delim("data/raw_counts.tsv", check.names = FALSE)
+meta <- read.delim(
+  "data/metadata.tsv",
+  check.names = FALSE,
+  colClasses = c("character", "character")
+)
+
+# ---- 2) Build count matrix (genes x samples) ----
+gene_col <- colnames(counts)[1]
+genes <- counts[[gene_col]]
+
+mat <- as.matrix(counts[, -1])
+rownames(mat) <- genes
+
+# ---- 3) Align metadata to count columns (CRITICAL) ----
+stopifnot(all(colnames(mat) %in% meta$sample))
+meta <- meta[match(colnames(mat), meta$sample), ]
+stopifnot(all(meta$sample == colnames(mat)))
+
+# ---- 4) QC: library size (total counts per sample) ----
+libsize <- colSums(mat)
+
+png("results/qc_library_size.png", width = 900, height = 500)
+plot(libsize, ylab = "Library size (total counts)", xlab = "Sample index")
+abline(h = median(libsize), lty = 2)
+dev.off()
+
+# ---- 5) QC: detected genes per sample ----
+detected_genes <- colSums(mat > 0)
+
+png("results/qc_detected_genes.png", width = 900, height = 500)
+plot(detected_genes, ylab = "Genes with count > 0", xlab = "Sample index")
+abline(h = median(detected_genes), lty = 2)
+dev.off()
+
+# ---- 6) Normalize for PCA (CPM + log1p) ----
+cpm <- sweep(mat, 2, libsize / 1e6, "/")
+log_cpm <- log1p(cpm)
+
+# Remove genes that have zero variance (PCA scaling fails otherwise)
+gene_var <- apply(log_cpm, 1, var)
+log_cpm2 <- log_cpm[gene_var > 0, ]
+
+# ---- 7) PCA ----
+pca <- prcomp(t(log_cpm2), scale. = TRUE)
+
+pc_df <- data.frame(
+  sample = colnames(log_cpm2),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  group = meta$group,
+  stringsAsFactors = FALSE
+)
+
+# PCA plot colored by group (cleaner than labeling every point)
+png("results/pca_logcpm.png", width = 900, height = 600)
+plot(pc_df$PC1, pc_df$PC2,
+     xlab = "PC1", ylab = "PC2",
+     main = "PCA (log1p-CPM; colored by group)",
+     pch = 19,
+     col = as.factor(pc_df$group))
+legend("topright",
+       legend = levels(as.factor(pc_df$group)),
+       pch = 19,
+       col = 1:length(levels(as.factor(pc_df$group))))
+dev.off()
+
+# Optional: PCA excluding unknown samples (often easier to interpret)
+keep <- pc_df$group %in% c("control", "disease")
+pc_df2 <- pc_df[keep, ]
+
+png("results/pca_logcpm_control_vs_disease.png", width = 900, height = 600)
+plot(pc_df2$PC1, pc_df2$PC2,
+     xlab = "PC1", ylab = "PC2",
+     main = "PCA (control vs disease only)",
+     pch = 19,
+     col = as.factor(pc_df2$group))
+legend("topright",
+       legend = levels(as.factor(pc_df2$group)),
+       pch = 19,
+       col = 1:length(levels(as.factor(pc_df2$group))))
+dev.off()
+
+# ---- 8) Sample correlation heatmap ----
+cor_mat <- cor(log_cpm2, method = "pearson")
+
+png("results/sample_correlation.png", width = 900, height = 800)
+image(cor_mat, main = "Sample correlation (log1p-CPM)", axes = FALSE)
+dev.off()
+
+# ---- 9) Save simple QC summary for reporting ----
+qc_summary <- data.frame(
+  sample = colnames(mat),
+  group = meta$group,
+  library_size = libsize,
+  detected_genes = detected_genes,
+  stringsAsFactors = FALSE
+)
+
+write.table(qc_summary, "results/qc_summary.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ---- Final sanity checks ----
+table(meta$group)
+dim(mat)
+dim(log_cpm2)
+head(qc_summary)
+```
+
