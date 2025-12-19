@@ -1,0 +1,112 @@
+---
+title: "Differential Expression with DESeq2 (control vs disease)"
+output: html_document
+date: "2025-12-19"
+---
+```{r}
+# Run notebook from project root
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+# Create results folder
+dir.create("results", showWarnings = FALSE)
+
+# ---- 1) Load standardized inputs ----
+counts <- read.delim("data/raw_counts.tsv", check.names = FALSE)
+meta <- read.delim(
+  "data/metadata.tsv",
+  check.names = FALSE,
+  colClasses = c("character", "character")
+)
+
+# ---- 2) Build count matrix (genes x samples) ----
+gene_col <- colnames(counts)[1]
+genes <- counts[[gene_col]]
+
+mat <- as.matrix(counts[, -1])
+rownames(mat) <- genes
+
+# ---- 3) Align metadata to count columns ----
+stopifnot(all(colnames(mat) %in% meta$sample))
+meta <- meta[match(colnames(mat), meta$sample), ]
+stopifnot(all(meta$sample == colnames(mat)))
+
+# ---- 4) Keep only control vs disease (drop unknown) ----
+keep <- meta$group %in% c("control", "disease")
+meta2 <- meta[keep, , drop = FALSE]
+mat2  <- mat[, keep, drop = FALSE]
+
+# Make sure DESeq2 sees group as a factor with control as reference
+meta2$group <- factor(meta2$group, levels = c("control", "disease"))
+
+# ---- 5) Install/load DESeq2 ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("DESeq2", quietly = TRUE)) BiocManager::install("DESeq2")
+
+library(DESeq2)
+
+# ---- 6) Create DESeq2 dataset ----
+dds <- DESeqDataSetFromMatrix(
+  countData = round(mat2),  # DESeq2 expects integer counts
+  colData   = meta2,
+  design    = ~ group
+)
+
+# Filter very low-count genes (speeds up + reduces noise)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+# ---- 7) Run DESeq2 ----
+dds <- DESeq(dds)
+
+# ---- 8) Extract results (disease vs control) ----
+res <- results(dds, contrast = c("group", "disease", "control"))
+res_df <- as.data.frame(res)
+res_df$gene_id <- rownames(res_df)
+
+# Reorder columns nicely
+res_df <- res_df[, c("gene_id", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+# Sort by adjusted p-value
+res_df <- res_df[order(res_df$padj, res_df$pvalue), ]
+
+# Save full results
+write.table(res_df, "results/deseq2_results.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Save top significant results (optional)
+sig <- subset(res_df, !is.na(padj) & padj < 0.05)
+write.table(sig, "results/deseq2_significant_padj_lt_0.05.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ---- 9) Basic QC plots: MA plot ----
+png("results/deseq2_MAplot.png", width = 900, height = 600)
+plotMA(res, main = "DESeq2 MA Plot (disease vs control)", ylim = c(-6, 6))
+dev.off()
+
+# ---- 10) Volcano plot (base R) ----
+# Create -log10(padj); avoid Inf
+vol <- res_df
+vol$neglog10padj <- -log10(pmax(vol$padj, 1e-300))
+vol$is_sig <- !is.na(vol$padj) & vol$padj < 0.05 & abs(vol$log2FoldChange) >= 1
+
+png("results/deseq2_volcano.png", width = 900, height = 600)
+plot(vol$log2FoldChange, vol$neglog10padj,
+     xlab = "log2 Fold Change (disease vs control)",
+     ylab = "-log10(adjusted p-value)",
+     main = "Volcano Plot (DESeq2)",
+     pch = 19)
+abline(v = c(-1, 1), lty = 2)
+abline(h = -log10(0.05), lty = 2)
+dev.off()
+
+# ---- 11) Save normalized counts (optional useful artifact) ----
+norm_counts <- counts(dds, normalized = TRUE)
+norm_df <- data.frame(gene_id = rownames(norm_counts), norm_counts, check.names = FALSE)
+write.table(norm_df, "results/deseq2_normalized_counts.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ---- 12) Print a small summary ----
+cat("\nSamples used (control vs disease):\n")
+print(table(meta2$group))
+
+cat("\n# Significant genes (padj < 0.05):", nrow(sig), "\n")
+cat("\nTop 10 genes by padj:\n")
+print(head(res_df, 10))
+```
+
