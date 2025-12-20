@@ -1,0 +1,225 @@
+---
+title: "Annotate DE genes + GO/KEGG enrichment"
+output: html_document
+date: "2025-12-19"
+---
+
+```{r setup, include=FALSE}
+# Always run this notebook from the project root (where the .Rproj file is)
+if (!requireNamespace("rprojroot", quietly = TRUE)) install.packages("rprojroot")
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+dir.create("results", showWarnings = FALSE)
+
+# ---- 1) Load DESeq2 results ----
+res_file <- "results/deseq2_results.tsv"
+stopifnot(file.exists(res_file))
+
+res_df <- read.delim(res_file, check.names = FALSE)
+res_df <- res_df[!is.na(res_df$padj), ]  # drop NA padj rows
+
+# ---- 2) Install/load packages ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+bioc_pkgs <- c("AnnotationDbi", "org.Hs.eg.db", "clusterProfiler", "enrichplot")
+for (p in bioc_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p)
+}
+
+cran_pkgs <- c("dplyr", "ggplot2")
+for (p in cran_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(dplyr)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+
+# ---- 3) Clean Ensembl IDs (remove version if present) ----
+# Example ENSG00000123456.12 -> ENSG00000123456
+res_df$ensembl <- sub("\\..*$", "", res_df$gene_id)
+
+# ---- 4) Map Ensembl -> SYMBOL and ENTREZID ----
+ann <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(res_df$ensembl),
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+
+# 'select()' may return one-to-many; keep the first mapping per Ensembl
+ann <- ann[!duplicated(ann$ENSEMBL), ]
+
+res_anno <- res_df %>%
+  left_join(ann, by = c("ensembl" = "ENSEMBL")) %>%
+  relocate(ensembl, SYMBOL, ENTREZID, .after = gene_id)
+
+# Save annotated DE table
+write.table(
+  res_anno,
+  "results/deseq2_results_annotated.tsv",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# ---- 5) Save top genes (interview-friendly) ----
+top10 <- res_anno %>% arrange(padj) %>% head(10)
+write.table(top10, "results/top10_genes_by_padj.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+top50 <- res_anno %>% arrange(padj) %>% head(50)
+write.table(top50, "results/top50_genes_by_padj.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ---- 6) Gene list for enrichment (padj < 0.05) ----
+sig <- res_anno %>% filter(padj < 0.05, !is.na(ENTREZID))
+sig_entrez <- unique(sig$ENTREZID)
+
+# ---- 7) GO enrichment (Biological Process) ----
+ego_bp <- enrichGO(
+  gene          = sig_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+write.table(as.data.frame(ego_bp),
+            "results/enrichGO_BP.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Plot GO using enrichplot (reliable)
+if (nrow(as.data.frame(ego_bp)) > 0) {
+  png("results/enrichGO_BP_dotplot.png", width = 1100, height = 750)
+  print(dotplot(ego_bp, showCategory = 15) + ggtitle("GO BP enrichment (padj < 0.05 genes)"))
+  dev.off()
+} else {
+  message("No GO BP terms passed cutoff; no GO plot created.")
+}
+
+# ---- 8) KEGG enrichment (can fail on some networks; handle gracefully) ----
+ekegg <- tryCatch({
+  enrichKEGG(
+    gene         = sig_entrez,
+    organism     = "hsa",
+    pvalueCutoff = 0.05
+  )
+}, error = function(e) e)
+
+if (inherits(ekegg, "error")) {
+  message("KEGG enrichment failed (likely network/KEGG access). Skipping KEGG. Error: ", ekegg$message)
+} else {
+  write.table(as.data.frame(ekegg),
+              "results/enrichKEGG.tsv",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  if (nrow(as.data.frame(ekegg)) > 0) {
+    png("results/enrichKEGG_dotplot.png", width = 1100, height = 750)
+    print(dotplot(ekegg, showCategory = 15) + ggtitle("KEGG enrichment (padj < 0.05 genes)"))
+    dev.off()
+  } else {
+    message("No KEGG terms passed cutoff; no KEGG plot created.")
+  }
+}
+
+# ---- 9) Small summary outputs ----
+cat("\nSaved:\n")
+cat("- results/deseq2_results_annotated.tsv\n")
+cat("- results/top10_genes_by_padj.tsv\n")
+cat("- results/enrichGO_BP.tsv\n")
+if (file.exists("results/enrichGO_BP_dotplot.png")) cat("- results/enrichGO_BP_dotplot.png\n")
+if (!inherits(ekegg, "error")) {
+  cat("- results/enrichKEGG.tsv\n")
+  if (file.exists("results/enrichKEGG_dotplot.png")) cat("- results/enrichKEGG_dotplot.png\n")
+}
+
+cat("\nCounts:\n")
+cat("- Significant genes used for enrichment (padj < 0.05 with ENTREZID): ", length(sig_entrez), "\n")
+```
+```{r}
+sig_strict <- res_anno %>%
+  filter(padj < 0.05, abs(log2FoldChange) >= 1, !is.na(ENTREZID))
+
+sig_strict_entrez <- unique(sig_strict$ENTREZID)
+length(sig_strict_entrez)
+
+```
+```{r}
+# =========================
+# OPTIONAL: Enrichment on a stricter, more meaningful gene set
+# (padj < 0.05 AND |log2FC| >= 1)
+# =========================
+
+sig_strict <- res_anno %>%
+  filter(padj < 0.05, abs(log2FoldChange) >= 1, !is.na(ENTREZID))
+
+sig_strict_entrez <- unique(sig_strict$ENTREZID)
+cat("Strict gene set size:", length(sig_strict_entrez), "\n")
+
+# ---- GO BP enrichment (STRICT) ----
+ego_bp_strict <- enrichGO(
+  gene          = sig_strict_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+write.table(as.data.frame(ego_bp_strict),
+            "results/enrichGO_BP_strict.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+if (nrow(as.data.frame(ego_bp_strict)) > 0) {
+  png("results/enrichGO_BP_dotplot_strict.png", width = 1100, height = 750)
+  print(dotplot(ego_bp_strict, showCategory = 15) +
+          ggtitle("GO BP enrichment (STRICT: padj<0.05 & |log2FC|>=1)"))
+  dev.off()
+} else {
+  message("No GO BP terms passed cutoff for STRICT gene set.")
+}
+
+# ---- KEGG enrichment (STRICT) ----
+ekegg_strict <- tryCatch({
+  enrichKEGG(
+    gene         = sig_strict_entrez,
+    organism     = "hsa",
+    pvalueCutoff = 0.05
+  )
+}, error = function(e) e)
+
+if (inherits(ekegg_strict, "error")) {
+  message("STRICT KEGG failed. Skipping. Error: ", ekegg_strict$message)
+} else {
+  write.table(as.data.frame(ekegg_strict),
+              "results/enrichKEGG_strict.tsv",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  if (nrow(as.data.frame(ekegg_strict)) > 0) {
+    png("results/enrichKEGG_dotplot_strict.png", width = 1100, height = 750)
+    print(dotplot(ekegg_strict, showCategory = 15) +
+            ggtitle("KEGG enrichment (STRICT: padj<0.05 & |log2FC|>=1)"))
+    dev.off()
+  } else {
+    message("No KEGG terms passed cutoff for STRICT gene set.")
+  }
+}
+
+```
+```{r}
+head(read.delim("results/enrichGO_BP_strict.tsv"), 5)
+head(read.delim("results/enrichKEGG_strict.tsv"), 5)
+
+```
+
+
+
