@@ -1,0 +1,161 @@
+---
+title: "Heatmap of Top 50 DE genes + export matrix"
+output: html_document
+date: "2025-12-20"
+---
+
+```{r setup, include=FALSE}
+# Always run from project root (Rmd is in notebooks/)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+# Make sure paths resolve correctly during knit
+options(stringsAsFactors = FALSE)
+
+```
+
+### Chunk 2 (all analysis in one chunk)
+
+```{r}
+
+### Chunk 2 (all analysis in one chunk)
+
+
+dir.create("results", showWarnings = FALSE)
+
+# ---- 1) Load inputs ----
+res_file <- "results/deseq2_results.tsv"
+norm_file <- "results/deseq2_normalized_counts.tsv"
+meta_file <- "data/metadata.tsv"
+
+stopifnot(file.exists(res_file))
+stopifnot(file.exists(norm_file))
+stopifnot(file.exists(meta_file))
+
+res_df <- read.delim(res_file, check.names = FALSE)
+meta <- read.delim(meta_file, check.names = FALSE, colClasses = c("character", "character", "character"))
+
+# Keep only control vs disease for plotting
+meta <- meta[meta$group %in% c("control", "disease"), , drop = FALSE]
+
+# ---- 2) Load normalized counts ----
+norm_df <- read.delim(norm_file, check.names = FALSE)
+stopifnot("gene_id" %in% colnames(norm_df))
+
+# Build matrix genes x samples
+genes <- norm_df$gene_id
+mat <- as.matrix(norm_df[, setdiff(colnames(norm_df), "gene_id"), drop = FALSE])
+rownames(mat) <- genes
+
+# Align samples to metadata (critical)
+stopifnot(all(meta$sample %in% colnames(mat)))
+mat <- mat[, meta$sample, drop = FALSE]
+stopifnot(all(colnames(mat) == meta$sample))
+
+# ---- 3) Choose top genes (padj + effect size) ----
+res_df <- res_df[!is.na(res_df$padj), ]
+res_df$absLFC <- abs(res_df$log2FoldChange)
+
+# Use stricter filter for interview credibility: padj<0.05 & |log2FC|>=1
+res_top <- subset(res_df, padj < 0.05 & absLFC >= 1)
+
+# If too few, fall back to padj only
+if (nrow(res_top) < 50) {
+  res_top <- subset(res_df, padj < 0.05)
+}
+
+res_top <- res_top[order(res_top$padj, -res_top$absLFC), ]
+top_genes <- head(res_top$gene_id, 50)
+
+# ---- 4) Build heatmap matrix ----
+hm <- mat[top_genes, , drop = FALSE]
+
+# log-transform for visualization (counts are positive)
+hm_log <- log2(hm + 1)
+
+# Scale each gene (row) to show relative up/down across samples
+hm_scaled <- t(scale(t(hm_log)))
+hm_scaled[is.na(hm_scaled)] <- 0
+
+# ---- 5) Save the exact matrix used (for GitHub transparency) ----
+heatmap_export <- data.frame(gene_id = rownames(hm_scaled), hm_scaled, check.names = FALSE)
+write.table(heatmap_export, "results/top50_heatmap_matrix_scaled.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Save top genes list
+write.table(data.frame(gene_id = top_genes),
+            "results/top50_genes_for_heatmap.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ---- 6) Plot heatmap (base R, no extra packages needed) ----
+# Order samples by group for nicer plot
+ord <- order(meta$group)
+hm_scaled <- hm_scaled[, ord, drop = FALSE]
+meta_ord <- meta[ord, , drop = FALSE]
+
+png("results/top50_heatmap.png", width = 1200, height = 900)
+par(mar = c(7, 7, 4, 2))
+image(
+  x = 1:ncol(hm_scaled),
+  y = 1:nrow(hm_scaled),
+  z = t(hm_scaled[nrow(hm_scaled):1, ]),
+  axes = FALSE,
+  xlab = "", ylab = "",
+  main = "Top 50 DE genes (scaled log2 normalized counts)"
+)
+axis(1, at = 1:ncol(hm_scaled), labels = meta_ord$group, las = 2, cex.axis = 0.7)
+axis(2, at = 1:nrow(hm_scaled), labels = rev(rownames(hm_scaled)), las = 2, cex.axis = 0.5)
+box()
+
+# Add group separator line
+grp_changes <- which(meta_ord$group[-1] != meta_ord$group[-nrow(meta_ord)])
+if (length(grp_changes) > 0) abline(v = grp_changes + 0.5, lty = 2)
+
+dev.off()
+
+# ---- 7) Quick “story” output you can say in interview ----
+cat("\nSaved:\n")
+cat("- results/top50_heatmap.png\n")
+cat("- results/top50_heatmap_matrix_scaled.tsv\n")
+cat("- results/top50_genes_for_heatmap.tsv\n\n")
+
+cat("Heatmap samples:", ncol(hm_scaled), "\n")
+cat("Heatmap genes:", nrow(hm_scaled), "\n")
+print(table(meta$group))
+
+```
+```{r}
+# ---- Annotate top genes with SYMBOL ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("AnnotationDbi", quietly = TRUE)) BiocManager::install("AnnotationDbi")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+top_ensembl <- sub("\\..*$", "", top_genes)
+
+ann_top <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(top_ensembl),
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)
+
+ann_top <- ann_top[!duplicated(ann_top$ENSEMBL), ]
+symbol_map <- setNames(ann_top$SYMBOL, ann_top$ENSEMBL)
+
+top_symbols <- symbol_map[top_ensembl]
+top_symbols[is.na(top_symbols)] <- top_ensembl[is.na(top_symbols)]  # fallback
+
+# Save mapping table
+write.table(
+  data.frame(gene_id = top_genes, ensembl = top_ensembl, symbol = top_symbols),
+  "results/top50_gene_symbol_map.tsv",
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+# Use gene symbols as rownames for heatmap display
+rownames(hm_scaled) <- make.unique(top_symbols)
+
+```
+
