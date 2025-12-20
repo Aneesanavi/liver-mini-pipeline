@@ -1,0 +1,5 @@
+Samples used: 14 control; 31 disease
+Genes tested (after filter): 16253
+Significant (padj < 0.05): 5810
+Significant (padj < 0.05 & |log2FC| >= 1): 929
+padj median: 0.1685
