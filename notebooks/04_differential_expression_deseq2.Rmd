@@ -3,11 +3,17 @@ title: "Differential Expression with DESeq2 (control vs disease)"
 output: html_document
 date: "2025-12-19"
 ---
-```{r}
-# Run notebook from project root
-knitr::opts_knit$set(root.dir = normalizePath(".."))
 
-# Create results folder
+
+```{r setup, include=FALSE}
+# Always run this notebook from the project root (where the .Rproj file is)
+if (!requireNamespace("rprojroot", quietly = TRUE)) install.packages("rprojroot")
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+
+
+```{r}
 dir.create("results", showWarnings = FALSE)
 
 # ---- 1) Load standardized inputs ----
@@ -35,53 +41,42 @@ keep <- meta$group %in% c("control", "disease")
 meta2 <- meta[keep, , drop = FALSE]
 mat2  <- mat[, keep, drop = FALSE]
 
-# Make sure DESeq2 sees group as a factor with control as reference
 meta2$group <- factor(meta2$group, levels = c("control", "disease"))
+stopifnot(all(colnames(mat2) == meta2$sample))
 
 # ---- 5) Install/load DESeq2 ----
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 if (!requireNamespace("DESeq2", quietly = TRUE)) BiocManager::install("DESeq2")
-
 library(DESeq2)
 
-# ---- 6) Create DESeq2 dataset ----
+# ---- 6) Create DESeq2 dataset + filter ----
 dds <- DESeqDataSetFromMatrix(
-  countData = round(mat2),  # DESeq2 expects integer counts
+  countData = round(mat2),
   colData   = meta2,
   design    = ~ group
 )
-
-# Filter very low-count genes (speeds up + reduces noise)
 dds <- dds[rowSums(counts(dds)) >= 10, ]
 
 # ---- 7) Run DESeq2 ----
 dds <- DESeq(dds)
-
-# ---- 8) Extract results (disease vs control) ----
 res <- results(dds, contrast = c("group", "disease", "control"))
+
+# ---- 8) Save results ----
 res_df <- as.data.frame(res)
 res_df$gene_id <- rownames(res_df)
-
-# Reorder columns nicely
 res_df <- res_df[, c("gene_id", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
-
-# Sort by adjusted p-value
 res_df <- res_df[order(res_df$padj, res_df$pvalue), ]
 
-# Save full results
 write.table(res_df, "results/deseq2_results.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
 
-# Save top significant results (optional)
 sig <- subset(res_df, !is.na(padj) & padj < 0.05)
 write.table(sig, "results/deseq2_significant_padj_lt_0.05.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
 
-# ---- 9) Basic QC plots: MA plot ----
+# ---- 9) Plots ----
 png("results/deseq2_MAplot.png", width = 900, height = 600)
 plotMA(res, main = "DESeq2 MA Plot (disease vs control)", ylim = c(-6, 6))
 dev.off()
 
-# ---- 10) Volcano plot (base R) ----
-# Create -log10(padj); avoid Inf
 vol <- res_df
 vol$neglog10padj <- -log10(pmax(vol$padj, 1e-300))
 vol$is_sig <- !is.na(vol$padj) & vol$padj < 0.05 & abs(vol$log2FoldChange) >= 1
@@ -91,22 +86,33 @@ plot(vol$log2FoldChange, vol$neglog10padj,
      xlab = "log2 Fold Change (disease vs control)",
      ylab = "-log10(adjusted p-value)",
      main = "Volcano Plot (DESeq2)",
-     pch = 19)
+     pch = 19,
+     col = ifelse(vol$is_sig, "red", "grey"))
 abline(v = c(-1, 1), lty = 2)
 abline(h = -log10(0.05), lty = 2)
 dev.off()
 
-# ---- 11) Save normalized counts (optional useful artifact) ----
+# ---- 10) Save normalized counts ----
 norm_counts <- counts(dds, normalized = TRUE)
 norm_df <- data.frame(gene_id = rownames(norm_counts), norm_counts, check.names = FALSE)
 write.table(norm_df, "results/deseq2_normalized_counts.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
 
-# ---- 12) Print a small summary ----
-cat("\nSamples used (control vs disease):\n")
-print(table(meta2$group))
+# ---- 11) Save a short summary text ----
+summary_lines <- c(
+  paste0("Samples used: ", sum(meta2$group == "control"), " control; ", sum(meta2$group == "disease"), " disease"),
+  paste0("Genes tested (after filter): ", nrow(dds)),
+  paste0("Significant (padj < 0.05): ", sum(!is.na(res$padj) & res$padj < 0.05)),
+  paste0("Significant (padj < 0.05 & |log2FC| >= 1): ", sum(!is.na(res$padj) & res$padj < 0.05 & abs(res$log2FoldChange) >= 1)),
+  paste0("padj median: ", round(median(res$padj, na.rm = TRUE), 4))
+)
+writeLines(summary_lines, "results/deseq2_summary.txt")
 
-cat("\n# Significant genes (padj < 0.05):", nrow(sig), "\n")
-cat("\nTop 10 genes by padj:\n")
+# ---- Quick check output ----
+print(table(meta2$group))
 print(head(res_df, 10))
+
 ```
+
+
+
 
