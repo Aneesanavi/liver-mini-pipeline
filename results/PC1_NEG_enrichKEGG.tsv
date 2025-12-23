@@ -1,0 +1,2 @@
+category	subcategory	ID	Description	GeneRatio	BgRatio	pvalue	p.adjust	qvalue	geneID	Count
+Human Diseases	Infectious disease: viral	hsa05171	Coronavirus disease - COVID-19	1/1	238/9520	0.0250000000000001	0.0250000000000001	NA	51065	1
