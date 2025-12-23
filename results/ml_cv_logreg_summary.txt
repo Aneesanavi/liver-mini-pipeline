@@ -1,0 +1,9 @@
+Features: PCA(10 PCs)
+Model: logistic regression
+K-fold: 5
+CV Accuracy mean: 0.756 | SD: 0.145
+CV Balanced Accuracy mean: 0.698 | SD: 0.225
+CV AUC mean: NA (install pROC)
+Fold Accuracy: 0.556, 0.889, 0.889, 0.778, 0.667
+Fold Balanced Acc: 0.5, 0.875, 0.938, 0.75, 0.429
+Fold AUC: NA, NA, NA, NA, NA
