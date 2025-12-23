@@ -1,0 +1,23 @@
+FROM rocker/r-ver:4.3.2
+
+# System deps for common R/Bioconductor packages + plots
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential g++ make pkg-config \
+      libcurl4-openssl-dev libssl-dev libxml2-dev \
+      libfontconfig1-dev libfreetype6-dev libharfbuzz-dev libfribidi-dev \
+      libpng-dev libtiff5-dev libjpeg-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# Install CRAN packages
+RUN R -q -e "install.packages(c('data.table','ggplot2','pROC'), repos='https://cloud.r-project.org')"
+
+# Install Bioconductor packages
+RUN R -q -e "install.packages('BiocManager', repos='https://cloud.r-project.org')"
+RUN R -q -e "BiocManager::install(c('GEOquery','DESeq2','AnnotationDbi','org.Hs.eg.db'), ask=FALSE, update=FALSE)"
+
+# Optional: if you later want enrichment in-container
+# RUN R -q -e "BiocManager::install(c('clusterProfiler'), ask=FALSE, update=FALSE)"
+
+WORKDIR /work
