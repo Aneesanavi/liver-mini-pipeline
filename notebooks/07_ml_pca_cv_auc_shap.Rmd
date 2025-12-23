@@ -1,0 +1,507 @@
+
+```{r setup, include=FALSE}
+# Always run from project root (Rmd is in notebooks/)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+```
+
+```{r}
+# =========================
+# NOTEBOOK 07
+# ML baseline (logistic regression) using PCA features
+# + Holdout metrics + 5-fold CV + SHAP (fastshap)
+# =========================
+
+dir.create("results", showWarnings = FALSE)
+
+# ---- Helper: safe sample ID formatting (keeps leading zeros) ----
+safe_id <- function(x) {
+  x <- as.character(x)
+  out <- suppressWarnings(as.integer(x))
+  ifelse(!is.na(out), sprintf("%04d", out), x)
+}
+
+# ---- Metrics: Accuracy, Balanced Accuracy, AUC ----
+metrics_binary <- function(y_true, prob, thr = 0.5) {
+  y_true <- as.integer(y_true)
+  stopifnot(all(y_true %in% c(0L, 1L)))
+
+  pred <- ifelse(prob >= thr, 1L, 0L)
+
+  tp <- sum(pred == 1L & y_true == 1L)
+  tn <- sum(pred == 0L & y_true == 0L)
+  fp <- sum(pred == 1L & y_true == 0L)
+  fn <- sum(pred == 0L & y_true == 1L)
+
+  acc <- (tp + tn) / max(1, (tp + tn + fp + fn))
+
+  sens <- ifelse((tp + fn) == 0, NA, tp / (tp + fn)) # TPR
+  spec <- ifelse((tn + fp) == 0, NA, tn / (tn + fp)) # TNR
+  bal_acc <- mean(c(sens, spec), na.rm = TRUE)
+
+  auc <- NA
+  if (requireNamespace("pROC", quietly = TRUE)) {
+    roc_obj <- pROC::roc(response = y_true, predictor = prob, quiet = TRUE, direction = "<")
+    auc <- as.numeric(pROC::auc(roc_obj))
+  }
+
+  list(acc = acc, bal_acc = bal_acc, auc = auc, tp = tp, tn = tn, fp = fp, fn = fn)
+}
+
+# =========================
+# 0) Load metadata
+# =========================
+meta <- read.delim(
+  "data/metadata.tsv",
+  check.names = FALSE,
+  colClasses = c("character", "character")
+)
+stopifnot(all(c("sample", "group") %in% colnames(meta)))
+
+meta <- meta[meta$group %in% c("control", "disease"), , drop = FALSE]
+meta$sample <- safe_id(meta$sample)
+
+cat("Samples in metadata:\n")
+print(table(meta$group))
+
+# =========================
+# 1) Load top50 scaled heatmap matrix
+# =========================
+hm_file <- "results/top50_heatmap_matrix_scaled.tsv"
+stopifnot(file.exists(hm_file))
+
+hm_df <- read.delim(hm_file, check.names = FALSE)
+stopifnot("gene_id" %in% colnames(hm_df))
+
+genes <- hm_df$gene_id
+Xg <- as.matrix(hm_df[, setdiff(colnames(hm_df), "gene_id"), drop = FALSE])
+rownames(Xg) <- genes
+
+# genes x samples -> samples x genes
+X <- t(Xg)
+rownames(X) <- safe_id(rownames(X))
+storage.mode(X) <- "double"
+
+# =========================
+# 2) Align samples
+# =========================
+common <- intersect(meta$sample, rownames(X))
+stopifnot(length(common) >= 10)
+
+# Keep common samples and enforce SAME ORDER everywhere
+common <- sort(common)
+
+meta <- meta[meta$sample %in% common, , drop = FALSE]
+meta <- meta[match(common, meta$sample), , drop = FALSE]
+X <- X[common, , drop = FALSE]
+
+stopifnot(all(meta$sample == rownames(X)))
+
+y <- ifelse(meta$group == "disease", 1L, 0L)
+
+cat("\nFinal aligned samples:\n")
+print(table(meta$group))
+
+# =========================
+# 3) PCA features (recommended)
+# =========================
+USE_PCA <- TRUE
+N_PC <- 10
+
+if (USE_PCA) {
+  pca <- prcomp(X, center = TRUE, scale. = TRUE)
+  max_pc <- min(ncol(pca$x), nrow(pca$x) - 1)
+  k <- min(N_PC, max_pc)
+  X_feat <- pca$x[, 1:k, drop = FALSE]        # <-- FIX: keep 1:k, not only 1
+  colnames(X_feat) <- paste0("PC", seq_len(k))
+  feat_name <- paste0("PCA(", k, " PCs)")
+} else {
+  X_feat <- X
+  feat_name <- "Top50 genes (scaled)"
+}
+
+feat_out <- data.frame(sample = rownames(X_feat), group = meta$group, X_feat, check.names = FALSE)
+write.table(feat_out, "results/ml_features_used.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# =========================
+# 4) Holdout (80/20)
+# =========================
+set.seed(42)
+idx <- sample(seq_len(nrow(X_feat)))
+train_n <- floor(0.8 * nrow(X_feat))
+train_idx <- idx[1:train_n]
+test_idx  <- idx[(train_n + 1):nrow(X_feat)]
+
+X_train <- X_feat[train_idx, , drop = FALSE]
+y_train <- y[train_idx]
+X_test  <- X_feat[test_idx, , drop = FALSE]
+y_test  <- y[test_idx]
+
+df_train <- data.frame(y = y_train, X_train)
+df_test  <- data.frame(y = y_test, X_test)
+
+fit <- glm(y ~ ., data = df_train, family = binomial())
+prob_test <- predict(fit, newdata = df_test, type = "response")
+
+m_hold <- metrics_binary(y_test, prob_test, thr = 0.5)
+
+writeLines(c(
+  paste0("Features: ", feat_name),
+  "Model: logistic regression",
+  paste0("Train samples: ", nrow(X_train)),
+  paste0("Test samples: ", nrow(X_test)),
+  paste0("Holdout Accuracy: ", round(m_hold$acc, 3)),
+  paste0("Holdout Balanced Accuracy: ", round(m_hold$bal_acc, 3)),
+  paste0("Holdout AUC: ", ifelse(is.na(m_hold$auc), "NA (install pROC)", round(m_hold$auc, 3))),
+  paste0("Confusion (tp tn fp fn): ", m_hold$tp, " ", m_hold$tn, " ", m_hold$fp, " ", m_hold$fn)
+), "results/ml_holdout_logreg_summary.txt")
+
+cat("\nHOLDOUT metrics:\n")
+print(m_hold)
+
+# =========================
+# 5) 5-fold Cross-Validation
+# =========================
+set.seed(42)
+kfold <- 5
+fold_id <- sample(rep(1:kfold, length.out = nrow(X_feat)))  # <-- FIX: rep(1:kfold), not rep(1)
+
+accs <- numeric(kfold)
+balaccs <- numeric(kfold)
+aucs <- rep(NA_real_, kfold)
+
+for (k in 1:kfold) {  # <-- FIX: loop over all folds, not only 1
+  te <- which(fold_id == k)
+  tr <- setdiff(seq_len(nrow(X_feat)), te)
+
+  df_tr <- data.frame(y = y[tr], X_feat[tr, , drop = FALSE])
+  df_te <- data.frame(y = y[te], X_feat[te, , drop = FALSE])
+
+  fit_k <- glm(y ~ ., data = df_tr, family = binomial())
+  p_k <- predict(fit_k, newdata = df_te, type = "response")
+
+  mk <- metrics_binary(df_te$y, p_k, thr = 0.5)
+
+  accs[k] <- mk$acc
+  balaccs[k] <- mk$bal_acc
+  aucs[k] <- mk$auc
+}
+
+cv_lines <- c(
+  paste0("Features: ", feat_name),
+  "Model: logistic regression",
+  paste0("5-fold CV Accuracy mean: ", round(mean(accs), 3), " | SD: ", round(sd(accs), 3)),
+  paste0("5-fold CV Balanced Accuracy mean: ", round(mean(balaccs), 3), " | SD: ", round(sd(balaccs), 3)),
+  paste0(
+    "5-fold CV AUC mean: ",
+    if (all(is.na(aucs))) "NA (install pROC)"
+    else paste0(round(mean(aucs, na.rm = TRUE), 3), " | SD: ", round(sd(aucs, na.rm = TRUE), 3))
+  ),
+  paste0("Fold Accuracy: ", paste(round(accs, 3), collapse = ", ")),
+  paste0("Fold Balanced Acc: ", paste(round(balaccs, 3), collapse = ", ")),
+  paste0("Fold AUC: ", paste(ifelse(is.na(aucs), "NA", round(aucs, 3)), collapse = ", "))
+)
+
+writeLines(cv_lines, "results/ml_cv_logreg_summary.txt")
+
+cat("\nCV means:\n")
+cat("Accuracy:", round(mean(accs), 3),
+    "BalancedAcc:", round(mean(balaccs), 3),
+    "AUC:", ifelse(all(is.na(aucs)), NA, round(mean(aucs, na.rm = TRUE), 3)),
+    "\n")
+
+# =========================
+# 6) SHAP on PCA features (fastshap)
+# =========================
+# SHAP explains which PCs push predictions toward disease (positive) vs control (negative)
+
+if (!requireNamespace("fastshap", quietly = TRUE)) {
+  install.packages("fastshap")
+}
+
+if (requireNamespace("fastshap", quietly = TRUE)) {
+
+  pred_wrapper <- function(object, newdata) {
+    predict(object, newdata = newdata, type = "response")
+  }
+
+  set.seed(42)
+
+  # IMPORTANT: fastshap expects a data.frame X
+  X_train_df <- as.data.frame(X_train)
+
+  shap_values <- fastshap::explain(
+    object = fit,
+    X = X_train_df,
+    pred_wrapper = pred_wrapper,
+    nsim = 200,
+    adjust = TRUE
+  )
+
+  shap_df <- cbind(sample = rownames(X_train), shap_values)
+  write.table(shap_df, "results/shap_values_train.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+  shap_imp <- data.frame(
+    feature = colnames(shap_values),
+    mean_abs_shap = apply(abs(shap_values), 2, mean),
+    stringsAsFactors = FALSE
+  )
+  shap_imp <- shap_imp[order(-shap_imp$mean_abs_shap), ]
+
+  write.table(shap_imp, "results/shap_importance.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+  png("results/shap_importance_bar.png", width = 1000, height = 650)
+  par(mar = c(8, 6, 4, 2))
+  barplot(
+    height = shap_imp$mean_abs_shap,
+    names.arg = shap_imp$feature,
+    las = 2,
+    main = "SHAP importance (mean |SHAP|) — LogReg on PCA features",
+    ylab = "mean(|SHAP|)"
+  )
+  dev.off()
+
+  # Optional: beeswarm-like plot (ggplot2)
+  if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+  if (requireNamespace("ggplot2", quietly = TRUE)) {
+    library(ggplot2)
+
+    top_feat <- head(shap_imp$feature, 10)
+
+    shap_long <- data.frame(
+      sample = rep(rownames(X_train), times = ncol(shap_values)),
+      feature = rep(colnames(shap_values), each = nrow(shap_values)),
+      shap = as.vector(as.matrix(shap_values)),
+      stringsAsFactors = FALSE
+    )
+    shap_long <- shap_long[shap_long$feature %in% top_feat, , drop = FALSE]
+    shap_long$feature <- factor(shap_long$feature, levels = rev(top_feat))
+
+    p <- ggplot(shap_long, aes(x = shap, y = feature)) +
+      geom_point(alpha = 0.6, size = 1.6) +
+      ggtitle("SHAP distribution (top PCs) — Train set") +
+      xlab("SHAP value (push toward disease if +)") +
+      ylab("Feature (PC)")
+
+    ggsave("results/shap_beeswarm_topPCs.png", p, width = 10, height = 6)
+  }
+
+  cat("\nSHAP saved:\n")
+  cat("- results/shap_values_train.tsv\n")
+  cat("- results/shap_importance.tsv\n")
+  cat("- results/shap_importance_bar.png\n")
+  if (file.exists("results/shap_beeswarm_topPCs.png")) cat("- results/shap_beeswarm_topPCs.png\n")
+
+} else {
+  message("fastshap could not be installed/loaded; skipping SHAP.")
+}
+
+# =========================
+# 7) Save model coefficients
+# =========================
+coef_df <- data.frame(
+  term = names(coef(fit)),
+  coef = as.numeric(coef(fit)),
+  stringsAsFactors = FALSE
+)
+write.table(coef_df, "results/logreg_coefficients.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+cat("\nSaved key outputs:\n")
+cat("- results/ml_features_used.tsv\n")
+cat("- results/ml_holdout_logreg_summary.txt\n")
+cat("- results/ml_cv_logreg_summary.txt\n")
+cat("- results/logreg_coefficients.tsv\n")
+
+```
+
+```{r}
+# =========================
+# OPTION A: PC1 → genes → GO / KEGG
+# Uses top50 scaled heatmap matrix
+# =========================
+
+dir.create("results", showWarnings = FALSE)
+
+# ---- 0) Input files ----
+hm_file   <- "results/top50_heatmap_matrix_scaled.tsv"
+anno_file <- "results/deseq2_results_annotated.tsv"  # optional but recommended
+
+stopifnot(file.exists(hm_file))
+
+# ---- 1) Load top50 heatmap matrix (scaled) ----
+hm_df <- read.delim(hm_file, check.names = FALSE)
+stopifnot("gene_id" %in% colnames(hm_df))
+
+genes <- hm_df$gene_id
+Xg <- as.matrix(hm_df[, setdiff(colnames(hm_df), "gene_id"), drop = FALSE])
+rownames(Xg) <- genes
+
+# genes x samples -> samples x genes
+X <- t(Xg)
+storage.mode(X) <- "double"
+
+# Make sample IDs consistent
+safe_id <- function(x) {
+  x <- as.character(x)
+  suppressWarnings({
+    xi <- as.integer(x)
+    out <- ifelse(!is.na(xi) & nchar(x) <= 4, sprintf("%04d", xi), x)
+  })
+  out
+}
+rownames(X) <- safe_id(rownames(X))
+
+# ---- 2) PCA on top50 genes ----
+pca <- prcomp(X, center = TRUE, scale. = TRUE)
+
+# PC1 gene loadings (one value per gene)
+pc1_load <- pca$rotation[, 1]
+pc1_tbl <- data.frame(
+  gene_id = names(pc1_load),
+  PC1_loading = as.numeric(pc1_load),
+  abs_loading = abs(as.numeric(pc1_load)),
+  direction = ifelse(pc1_load >= 0, "PC1_POS", "PC1_NEG"),
+  stringsAsFactors = FALSE
+)
+pc1_tbl <- pc1_tbl[order(-pc1_tbl$abs_loading), ]
+
+write.table(pc1_tbl, "results/pc1_gene_loadings_top50.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ---- 3) Add gene symbols/Entrez (if annotated table exists) ----
+if (file.exists(anno_file)) {
+  anno <- read.delim(anno_file, check.names = FALSE)
+  keep_cols <- intersect(c("gene_id","ensembl","SYMBOL","ENTREZID"), colnames(anno))
+  anno <- unique(anno[, keep_cols, drop = FALSE])
+
+  pc1_tbl2 <- merge(pc1_tbl, anno, by = "gene_id", all.x = TRUE)
+  pc1_tbl2 <- pc1_tbl2[order(-pc1_tbl2$abs_loading), ]
+
+  write.table(pc1_tbl2, "results/pc1_gene_loadings_top50_annotated.tsv",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+} else {
+  pc1_tbl2 <- pc1_tbl
+}
+
+# ---- 4) Prepare gene sets for enrichment (Entrez IDs needed) ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+bioc_pkgs <- c("clusterProfiler", "org.Hs.eg.db", "AnnotationDbi", "enrichplot")
+for (p in bioc_pkgs) if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p)
+
+cran_pkgs <- c("dplyr", "ggplot2")
+for (p in cran_pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(enrichplot)
+library(ggplot2)
+
+# Ensure we have ENTREZID; if missing, map from Ensembl
+if (!("ENTREZID" %in% colnames(pc1_tbl2))) {
+  # map from Ensembl if present; else from gene_id (assumed Ensembl)
+  if (!("ensembl" %in% colnames(pc1_tbl2))) {
+    pc1_tbl2$ensembl <- sub("\\..*$", "", pc1_tbl2$gene_id)
+  }
+  ann <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = unique(pc1_tbl2$ensembl),
+    keytype = "ENSEMBL",
+    columns = c("SYMBOL", "ENTREZID")
+  )
+  ann <- ann[!duplicated(ann$ENSEMBL), ]
+  pc1_tbl2 <- pc1_tbl2 %>% left_join(ann, by = c("ensembl" = "ENSEMBL"))
+}
+
+pos_entrez <- pc1_tbl2 %>% filter(direction == "PC1_POS", !is.na(ENTREZID)) %>% pull(ENTREZID) %>% unique()
+neg_entrez <- pc1_tbl2 %>% filter(direction == "PC1_NEG", !is.na(ENTREZID)) %>% pull(ENTREZID) %>% unique()
+
+cat("PC1_POS Entrez:", length(pos_entrez), "\n")
+cat("PC1_NEG Entrez:", length(neg_entrez), "\n")
+
+# ---- 5) GO BP enrichment (PC1_POS) ----
+ego_pos <- enrichGO(
+  gene          = pos_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+write.table(as.data.frame(ego_pos), "results/PC1_POS_enrichGO_BP.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+if (nrow(as.data.frame(ego_pos)) > 0) {
+  png("results/PC1_POS_enrichGO_BP_dotplot.png", width = 1100, height = 750)
+  print(dotplot(ego_pos, showCategory = 15) + ggtitle("GO BP — PC1_POS genes"))
+  dev.off()
+}
+
+# ---- 6) GO BP enrichment (PC1_NEG) ----
+ego_neg <- enrichGO(
+  gene          = neg_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+write.table(as.data.frame(ego_neg), "results/PC1_NEG_enrichGO_BP.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+if (nrow(as.data.frame(ego_neg)) > 0) {
+  png("results/PC1_NEG_enrichGO_BP_dotplot.png", width = 1100, height = 750)
+  print(dotplot(ego_neg, showCategory = 15) + ggtitle("GO BP — PC1_NEG genes"))
+  dev.off()
+}
+
+# ---- 7) KEGG enrichment (PC1_POS + PC1_NEG) ----
+# KEGG may fail sometimes due to network/KEGG access; handle gracefully
+
+ekegg_pos <- tryCatch({
+  enrichKEGG(gene = pos_entrez, organism = "hsa", pvalueCutoff = 0.05)
+}, error = function(e) e)
+
+if (inherits(ekegg_pos, "error")) {
+  message("KEGG POS failed: ", ekegg_pos$message)
+} else {
+  write.table(as.data.frame(ekegg_pos), "results/PC1_POS_enrichKEGG.tsv",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  if (nrow(as.data.frame(ekegg_pos)) > 0) {
+    png("results/PC1_POS_enrichKEGG_dotplot.png", width = 1100, height = 750)
+    print(dotplot(ekegg_pos, showCategory = 15) + ggtitle("KEGG — PC1_POS genes"))
+    dev.off()
+  }
+}
+
+ekegg_neg <- tryCatch({
+  enrichKEGG(gene = neg_entrez, organism = "hsa", pvalueCutoff = 0.05)
+}, error = function(e) e)
+
+if (inherits(ekegg_neg, "error")) {
+  message("KEGG NEG failed: ", ekegg_neg$message)
+} else {
+  write.table(as.data.frame(ekegg_neg), "results/PC1_NEG_enrichKEGG.tsv",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  if (nrow(as.data.frame(ekegg_neg)) > 0) {
+    png("results/PC1_NEG_enrichKEGG_dotplot.png", width = 1100, height = 750)
+    print(dotplot(ekegg_neg, showCategory = 15) + ggtitle("KEGG — PC1_NEG genes"))
+    dev.off()
+  }
+}
+
+cat("\nSaved files:\n")
+cat("- results/pc1_gene_loadings_top50.tsv\n")
+if (file.exists("results/pc1_gene_loadings_top50_annotated.tsv")) cat("- results/pc1_gene_loadings_top50_annotated.tsv\n")
+cat("- results/PC1_POS_enrichGO_BP.tsv + dotplot\n")
+cat("- results/PC1_NEG_enrichGO_BP.tsv + dotplot\n")
+cat("- results/PC1_POS_enrichKEGG.tsv + dotplot (if KEGG worked)\n")
+cat("- results/PC1_NEG_enrichKEGG.tsv + dotplot (if KEGG worked)\n")
+
+```
+
