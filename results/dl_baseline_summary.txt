@@ -1,0 +1,4 @@
+Model: logistic regression baseline (top50 genes)
+Train samples: 36
+Test samples: 9
+Test accuracy: 0.667
