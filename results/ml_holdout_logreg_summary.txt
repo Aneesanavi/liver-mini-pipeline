@@ -1,0 +1,8 @@
+Features: PCA(10 PCs)
+Model: logistic regression
+Train samples: 36
+Test samples: 9
+Holdout Accuracy: 0.778
+Holdout Balanced Accuracy: 0.679
+Holdout AUC: NA (install pROC)
+Confusion tp/tn/fp/fn: 6/1/1/1
